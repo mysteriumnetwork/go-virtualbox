@@ -2,11 +2,11 @@ package virtualbox
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -201,18 +201,16 @@ func (m *Machine) Delete() error {
 	return Manage().run("unregistervm", m.Name, "--delete")
 }
 
-var mutex sync.Mutex
-
-// GetMachine finds a machine by its name or UUID.
-func GetMachine(id string) (*Machine, error) {
+// Machine returns the current machine state based on the current state.
+func (m *manager) Machine(ctx context.Context, id string) (*Machine, error) {
 	/* There is a strage behavior where running multiple instances of
 	'VBoxManage showvminfo' on same VM simultaneously can return an error of
 	'object is not ready (E_ACCESSDENIED)', so we sequential the operation with a mutex.
 	Note if you are running multiple process of go-virtualbox or 'showvminfo'
 	in the command line side by side, this not gonna work. */
-	mutex.Lock()
-	stdout, stderr, err := Manage().runOutErr("showvminfo", id, "--machinereadable")
-	mutex.Unlock()
+	m.lock.Lock()
+	stdout, stderr, err := m.run(ctx, "showvminfo", id, "--machinereadable")
+	m.lock.Unlock()
 	if err != nil {
 		if reMachineNotFound.FindString(stderr) != "" {
 			return nil, ErrMachineNotExist
@@ -240,27 +238,27 @@ func GetMachine(id string) (*Machine, error) {
 	}
 
 	/* Extract basic info */
-	m := New()
-	m.Name = propMap["name"]
-	m.UUID = propMap["UUID"]
-	m.State = MachineState(propMap["VMState"])
+	vm := New()
+	vm.Name = propMap["name"]
+	vm.UUID = propMap["UUID"]
+	vm.State = MachineState(propMap["VMState"])
 	n, err := strconv.ParseUint(propMap["memory"], 10, 32)
 	if err != nil {
 		return nil, err
 	}
-	m.Memory = uint(n)
+	vm.Memory = uint(n)
 	n, err = strconv.ParseUint(propMap["cpus"], 10, 32)
 	if err != nil {
 		return nil, err
 	}
-	m.CPUs = uint(n)
+	vm.CPUs = uint(n)
 	n, err = strconv.ParseUint(propMap["vram"], 10, 32)
 	if err != nil {
 		return nil, err
 	}
-	m.VRAM = uint(n)
-	m.CfgFile = propMap["CfgFile"]
-	m.BaseFolder = filepath.Dir(m.CfgFile)
+	vm.VRAM = uint(n)
+	vm.CfgFile = propMap["CfgFile"]
+	vm.BaseFolder = filepath.Dir(vm.CfgFile)
 
 	/* Extract NIC info */
 	for i := 1; i <= 4; i++ {
@@ -283,21 +281,38 @@ func GetMachine(id string) (*Machine, error) {
 		} else if nic.Network == NICNetBridged {
 			nic.HostInterface = propMap[fmt.Sprintf("bridgeadapter%d", i)]
 		}
-		m.NICs = append(m.NICs, nic)
+		vm.NICs = append(vm.NICs, nic)
 	}
 
 	if err := s.Err(); err != nil {
 		return nil, err
 	}
-	return m, nil
+	return vm, nil
+}
+
+// GetMachine finds a machine by its name or UUID.
+//
+// Deprecated: Use Manager.Machine()
+func GetMachine(id string) (*Machine, error) {
+	return defaultManager.Machine(context.Background(), id)
 }
 
 // ListMachines lists all registered machines.
+//
+// Deprecated: Use Manager.ListMachines()
 func ListMachines() ([]*Machine, error) {
-	out, err := Manage().runOut("list", "vms")
+	return defaultManager.ListMachines(context.Background())
+}
+
+// ListMachines lists all registered machines.
+func (m *manager) ListMachines(ctx context.Context) ([]*Machine, error) {
+	m.lock.Lock()
+	out, _, err := m.run(ctx, "list", "vms")
+	m.lock.Unlock()
 	if err != nil {
 		return nil, err
 	}
+
 	ms := []*Machine{}
 	s := bufio.NewScanner(strings.NewReader(out))
 	for s.Scan() {
@@ -305,7 +320,7 @@ func ListMachines() ([]*Machine, error) {
 		if res == nil {
 			continue
 		}
-		m, err := GetMachine(res[1])
+		m, err := m.Machine(ctx, res[1])
 		if err != nil {
 			// Sometimes a VM is listed but not available, so we need to handle this.
 			if err == ErrMachineNotExist {
@@ -356,44 +371,44 @@ func CreateMachine(name, basefolder string) (*Machine, error) {
 	return m, nil
 }
 
-// Modify changes the settings of the machine.
-func (m *Machine) Modify() error {
-	args := []string{"modifyvm", m.Name,
+// UpdateMachine updates the machine details based on the struct fields.
+func (m *manager) UpdateMachine(ctx context.Context, vm *Machine) error {
+	args := []string{"modifyvm", vm.Name,
 		"--firmware", "bios",
 		"--bioslogofadein", "off",
 		"--bioslogofadeout", "off",
 		"--bioslogodisplaytime", "0",
 		"--biosbootmenu", "disabled",
 
-		"--ostype", m.OSType,
-		"--cpus", fmt.Sprintf("%d", m.CPUs),
-		"--memory", fmt.Sprintf("%d", m.Memory),
-		"--vram", fmt.Sprintf("%d", m.VRAM),
+		"--ostype", vm.OSType,
+		"--cpus", fmt.Sprintf("%d", vm.CPUs),
+		"--memory", fmt.Sprintf("%d", vm.Memory),
+		"--vram", fmt.Sprintf("%d", vm.VRAM),
 
-		"--acpi", m.Flag.Get(ACPI),
-		"--ioapic", m.Flag.Get(IOAPIC),
-		"--rtcuseutc", m.Flag.Get(RTCUSEUTC),
-		"--cpuhotplug", m.Flag.Get(CPUHOTPLUG),
-		"--pae", m.Flag.Get(PAE),
-		"--longmode", m.Flag.Get(LONGMODE),
-		"--hpet", m.Flag.Get(HPET),
-		"--hwvirtex", m.Flag.Get(HWVIRTEX),
-		"--triplefaultreset", m.Flag.Get(TRIPLEFAULTRESET),
-		"--nestedpaging", m.Flag.Get(NESTEDPAGING),
-		"--largepages", m.Flag.Get(LARGEPAGES),
-		"--vtxvpid", m.Flag.Get(VTXVPID),
-		"--vtxux", m.Flag.Get(VTXUX),
-		"--accelerate3d", m.Flag.Get(ACCELERATE3D),
+		"--acpi", vm.Flag.Get(ACPI),
+		"--ioapic", vm.Flag.Get(IOAPIC),
+		"--rtcuseutc", vm.Flag.Get(RTCUSEUTC),
+		"--cpuhotplug", vm.Flag.Get(CPUHOTPLUG),
+		"--pae", vm.Flag.Get(PAE),
+		"--longmode", vm.Flag.Get(LONGMODE),
+		"--hpet", vm.Flag.Get(HPET),
+		"--hwvirtex", vm.Flag.Get(HWVIRTEX),
+		"--triplefaultreset", vm.Flag.Get(TRIPLEFAULTRESET),
+		"--nestedpaging", vm.Flag.Get(NESTEDPAGING),
+		"--largepages", vm.Flag.Get(LARGEPAGES),
+		"--vtxvpid", vm.Flag.Get(VTXVPID),
+		"--vtxux", vm.Flag.Get(VTXUX),
+		"--accelerate3d", vm.Flag.Get(ACCELERATE3D),
 	}
 
-	for i, dev := range m.BootOrder {
+	for i, dev := range vm.BootOrder {
 		if i > 3 {
 			break // Only four slots `--boot{1,2,3,4}`. Ignore the rest.
 		}
 		args = append(args, fmt.Sprintf("--boot%d", i+1), dev)
 	}
 
-	for i, nic := range m.NICs {
+	for i, nic := range vm.NICs {
 		n := i + 1
 		args = append(args,
 			fmt.Sprintf("--nic%d", n), string(nic.Network),
@@ -406,10 +421,14 @@ func (m *Machine) Modify() error {
 		}
 	}
 
-	if err := Manage().run(args...); err != nil {
+	if _, _, err := m.run(ctx, args...); err != nil {
 		return err
 	}
-	return m.Refresh()
+	return vm.Refresh()
+}
+
+func (m *Machine) Modify() error {
+	return defaultManager.UpdateMachine(context.Background(), m)
 }
 
 // AddNATPF adds a NAT port forarding rule to the n-th NIC with the given name.
@@ -463,22 +482,27 @@ func (m *Machine) DelStorageCtl(name string) error {
 
 // AttachStorage attaches a storage medium to the named storage controller.
 func (m *Machine) AttachStorage(ctlName string, medium StorageMedium) error {
-	return Manage().run("storageattach", m.Name, "--storagectl", ctlName,
+	_, _, err := defaultManager.run(context.Background(),
+		"storageattach", m.Name, "--storagectl", ctlName,
 		"--port", fmt.Sprintf("%d", medium.Port),
 		"--device", fmt.Sprintf("%d", medium.Device),
 		"--type", string(medium.DriveType),
 		"--medium", medium.Medium,
 	)
+	return err
 }
 
 // SetExtraData attaches custom string to the VM.
 func (m *Machine) SetExtraData(key, val string) error {
-	return Manage().run("setextradata", m.Name, key, val)
+	_, _, err := defaultManager.run(context.Background(),
+		"setextradata", m.Name, key, val)
+	return err
 }
 
 // GetExtraData retrieves custom string from the VM.
 func (m *Machine) GetExtraData(key string) (*string, error) {
-	value, err := Manage().runOut("getextradata", m.Name, key)
+	value, _, err := defaultManager.run(context.Background(),
+		"getextradata", m.Name, key)
 	if err != nil {
 		return nil, err
 	}
@@ -494,13 +518,19 @@ func (m *Machine) GetExtraData(key string) (*string, error) {
 
 // DeleteExtraData removes custom string from the VM.
 func (m *Machine) DeleteExtraData(key string) error {
-	return Manage().run("setextradata", m.Name, key)
+	_, _, err := defaultManager.run(context.Background(),
+		"setextradata", m.Name, key)
+	return err
 }
 
 // CloneMachine clones the given machine name into a new one.
 func CloneMachine(baseImageName string, newImageName string, register bool) error {
 	if register {
-		return Manage().run("clonevm", baseImageName, "--name", newImageName, "--register")
+		_, _, err := defaultManager.run(context.Background(),
+			"clonevm", baseImageName, "--name", newImageName, "--register")
+		return err
 	}
-	return Manage().run("clonevm", baseImageName, "--name", newImageName)
+	_, _, err := defaultManager.run(context.Background(),
+		"clonevm", baseImageName, "--name", newImageName)
+	return err
 }
